@@ -37,14 +37,28 @@ def get_device():
 # ---------------------------------------------------------------------------
 
 class MolmoPointGetItem(GetItem):
-    """Loads a PIL Image from a sample's filepath."""
+    """Loads a PIL Image (and optional per-sample prompt) from a sample.
+
+    When the user sets ``model.needs_fields = {"prompt_field": "my_field"}``,
+    FiftyOne adds ``"prompt_field"`` to the field mapping so that
+    ``sample_dict`` contains the per-sample value. If no mapping is set,
+    ``sample_dict.get("prompt_field")`` returns ``None`` and the model falls
+    back to the global ``model.prompt``.
+    """
 
     @property
     def required_keys(self):
+        # Only real dataset fields that always exist.
+        # "prompt_field" enters field_mapping only when the user explicitly
+        # maps it via model.needs_fields, so it must NOT be listed here.
         return ["filepath"]
 
     def __call__(self, sample_dict):
-        return Image.open(sample_dict["filepath"]).convert("RGB")
+        image = Image.open(sample_dict["filepath"]).convert("RGB")
+        return {
+            "image": image,
+            "prompt": sample_dict.get("prompt_field"),  # None if not mapped
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -60,23 +74,26 @@ class MolmoPointModel(Model, SupportsGetItem, TorchModelMixin):
 
     Args:
         model_path: Local directory or HuggingFace repo ID.
-        objects: Object(s) to point at. Accepts a comma-separated string
-            (``"boat, person"``) or a list of strings
-            (``["boat", "person"]``).
+        prompt: Object(s) to point at (global, applied to all samples).
+            Accepts a comma-separated string (``"boat, person"``) or a list
+            of strings (``["boat", "person"]``). Can also be set after
+            loading via ``model.prompt = ...``. For per-sample prompts, use
+            ``model.needs_fields = {"prompt_field": "your_field_name"}``
+            instead.
         **kwargs: Additional keyword arguments (ignored).
     """
 
     def __init__(
         self,
         model_path: str,
-        objects: Optional[Union[str, List[str]]] = None,
+        prompt: Optional[Union[str, List[str]]] = None,
         **kwargs,
     ):
         SupportsGetItem.__init__(self)
         self._preprocess = False
         self._fields = {}
         self.model_path = model_path
-        self.objects = objects  # normalised via property setter
+        self.prompt = prompt  # normalised via property setter
 
         self.device = get_device()
         logger.info(f"Using device: {self.device}")
@@ -107,22 +124,28 @@ class MolmoPointModel(Model, SupportsGetItem, TorchModelMixin):
         self._model.eval()
 
     # ------------------------------------------------------------------
-    # objects property
+    # prompt property
     # ------------------------------------------------------------------
 
     @property
-    def objects(self) -> List[str]:
-        """List of object descriptions to locate."""
-        return self._objects
+    def prompt(self) -> List[str]:
+        """List of object descriptions to locate (global, applied to all samples).
 
-    @objects.setter
-    def objects(self, value):
+        Can be set as a comma-separated string (``"boat, person"``) or a list
+        (``["boat", "person"]``). When ``needs_fields`` maps a dataset field to
+        ``"prompt_field"``, the per-sample value overrides this global prompt
+        for that sample.
+        """
+        return self._prompt
+
+    @prompt.setter
+    def prompt(self, value):
         if value is None:
-            self._objects = []
+            self._prompt = []
         elif isinstance(value, list):
-            self._objects = [str(v).strip() for v in value if str(v).strip()]
+            self._prompt = [str(v).strip() for v in value if str(v).strip()]
         else:
-            self._objects = [s.strip() for s in str(value).split(",") if s.strip()]
+            self._prompt = [s.strip() for s in str(value).split(",") if s.strip()]
 
     # ------------------------------------------------------------------
     # needs_fields – optional per-sample field mapping
@@ -282,41 +305,83 @@ class MolmoPointModel(Model, SupportsGetItem, TorchModelMixin):
     # Core inference
     # ------------------------------------------------------------------
 
+    def _resolve_objects(self, sample_prompt) -> List[str]:
+        """Return the object list to use for a single sample.
+
+        Per-sample prompt (from a dataset field) takes priority over the
+        global ``model.prompt``. The value is normalised the same way as
+        the ``prompt`` setter.
+        """
+        if sample_prompt is not None:
+            if isinstance(sample_prompt, list):
+                return [str(v).strip() for v in sample_prompt if str(v).strip()]
+            return [s.strip() for s in str(sample_prompt).split(",") if s.strip()]
+        return self._prompt
+
     def predict_all(
-        self, batch: List[Image.Image], preprocess=None
+        self, batch: List[dict], preprocess=None
     ) -> List[Keypoints]:
         """Run batched inference for all configured object prompts.
 
-        One forward pass is made per object string; results are accumulated
-        across prompts and returned as one ``fo.Keypoints`` per image.
+        Each item in *batch* is a dict with keys ``"image"`` (PIL Image) and
+        ``"prompt"`` (per-sample object string / list, or ``None`` to use the
+        global ``model.prompt``).
+
+        When all samples share the same prompt, a single batched forward pass
+        is made per object string. When prompts differ across samples, each
+        sample is processed individually.
 
         Args:
-            batch: List of PIL Images supplied by the DataLoader.
+            batch: List of dicts from ``MolmoPointGetItem``.
             preprocess: Unused; preprocessing is handled by GetItem.
 
         Returns:
-            List of ``fo.Keypoints``, one per image in *batch*.
+            List of ``fo.Keypoints``, one per item in *batch*.
         """
-        if not self._objects:
+        images = [item["image"] for item in batch]
+        sample_prompts = [item.get("prompt") for item in batch]
+
+        # Resolve the effective object list for each sample
+        per_sample_objects = [self._resolve_objects(p) for p in sample_prompts]
+
+        if not any(per_sample_objects):
             raise ValueError(
-                "No objects specified. Set model.objects = ['boat', 'person'] "
-                "or pass objects=... when loading the model."
+                "No objects specified. Set model.prompt = ['boat', 'person'], "
+                "or pass prompt=... when loading the model, "
+                "or use model.needs_fields = {'prompt_field': 'your_field'}."
             )
 
         accumulated: List[List[Keypoint]] = [[] for _ in batch]
 
-        for obj in self._objects:
-            batch_points = self._run_batch_for_object(batch, obj)
-            for i, (img, points) in enumerate(zip(batch, batch_points)):
-                width, height = img.size
-                for point in points:
-                    _obj_id, _img_num, x, y = point
-                    accumulated[i].append(
-                        Keypoint(
-                            label=obj,
-                            points=[[float(x) / width, float(y) / height]],
+        # Fast path: all samples share the same prompt → true batch inference
+        if len(set(tuple(o) for o in per_sample_objects)) == 1:
+            objects = per_sample_objects[0]
+            for obj in objects:
+                batch_points = self._run_batch_for_object(images, obj)
+                for i, (img, points) in enumerate(zip(images, batch_points)):
+                    width, height = img.size
+                    for point in points:
+                        _obj_id, _img_num, x, y = point
+                        accumulated[i].append(
+                            Keypoint(
+                                label=obj,
+                                points=[[float(x) / width, float(y) / height]],
+                            )
                         )
-                    )
+        else:
+            # Slow path: per-sample prompts differ → process each individually
+            for i, (img, objects) in enumerate(zip(images, per_sample_objects)):
+                for obj in objects:
+                    points_list = self._run_batch_for_object([img], obj)
+                    width, height = img.size
+                    for point in points_list[0]:
+                        _obj_id, _img_num, x, y = point
+                        accumulated[i].append(
+                            Keypoint(
+                                label=obj,
+                                points=[[float(x) / width, float(y) / height]],
+                            )
+                        )
 
         return [Keypoints(keypoints=kps) for kps in accumulated]
 
@@ -331,4 +396,4 @@ class MolmoPointModel(Model, SupportsGetItem, TorchModelMixin):
             ``fo.Keypoints``
         """
         pil_image = Image.fromarray(image)
-        return self.predict_all([pil_image])[0]
+        return self.predict_all([{"image": pil_image, "prompt": None}])[0]

@@ -29,8 +29,9 @@ def load_model(model_name, model_path, **kwargs):
         model_path: Local directory containing the downloaded model weights.
         **kwargs: Forwarded to :class:`MolmoPointModel`. Useful kwargs:
 
-            - ``objects`` (``str | list[str]``): Objects to point at, e.g.
-              ``["boat", "person"]`` or ``"boat, person"``.
+            - ``prompt`` (``str | list[str]``): Objects to point at, e.g.
+              ``["boat", "person"]`` or ``"boat, person"``. Can also be set
+              after loading via ``model.prompt = ...``.
 
     Returns:
         :class:`MolmoPointModel`
