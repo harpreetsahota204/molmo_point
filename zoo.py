@@ -121,12 +121,7 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
 
     @prompt.setter
     def prompt(self, value):
-        if value is None:
-            self._prompt = []
-        elif isinstance(value, list):
-            self._prompt = [str(v).strip() for v in value if str(v).strip()]
-        else:
-            self._prompt = [s.strip() for s in str(value).split(",") if s.strip()]
+        self._prompt = self._normalize_prompt(value)
 
     # ------------------------------------------------------------------
     # needs_fields – optional per-sample field mapping
@@ -215,10 +210,7 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
 
         model_kwargs = {"trust_remote_code": True}
         if self.device == "cuda":
-            capability = torch.cuda.get_device_capability(0)
-            model_kwargs["torch_dtype"] = (
-                torch.bfloat16 if capability[0] >= 8 else torch.float16
-            )
+            model_kwargs["torch_dtype"] = self._cuda_dtype()
             model_kwargs["device_map"] = self.device
         else:
             model_kwargs["torch_dtype"] = torch.float32
@@ -235,15 +227,31 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
     # Internal helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _normalize_prompt(value) -> List[str]:
+        """Normalise a raw prompt value into a list of stripped, non-empty strings."""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        return [s.strip() for s in str(value).split(",") if s.strip()]
+
+    @staticmethod
+    def _cuda_dtype() -> torch.dtype:
+        """Return the appropriate float dtype for the current CUDA device.
+
+        Uses bfloat16 on compute capability >= 8 (Ampere+), float16 otherwise.
+        """
+        return (
+            torch.bfloat16
+            if torch.cuda.get_device_capability(0)[0] >= 8
+            else torch.float16
+        )
+
     def _autocast_ctx(self):
         """Return appropriate autocast context for the current device."""
         if self.device == "cuda":
-            dtype = (
-                torch.bfloat16
-                if torch.cuda.get_device_capability(0)[0] >= 8
-                else torch.float16
-            )
-            return torch.autocast("cuda", dtype=dtype)
+            return torch.autocast("cuda", dtype=self._cuda_dtype())
         return contextlib.nullcontext()
 
     def _run_single_for_object(self, img: Image.Image, obj: str) -> list:
@@ -319,9 +327,7 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
         the ``prompt`` setter.
         """
         if sample_prompt is not None:
-            if isinstance(sample_prompt, list):
-                return [str(v).strip() for v in sample_prompt if str(v).strip()]
-            return [s.strip() for s in str(sample_prompt).split(",") if s.strip()]
+            return self._normalize_prompt(sample_prompt)
         return self._prompt
 
     def predict_all(
