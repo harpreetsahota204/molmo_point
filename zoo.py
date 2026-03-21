@@ -15,6 +15,7 @@ from PIL import Image
 import fiftyone as fo
 from fiftyone import Model
 from fiftyone.core.labels import Keypoint, Keypoints
+import fiftyone.core.models as fom
 from fiftyone.core.models import SupportsGetItem, TorchModelMixin
 from fiftyone.utils.torch import GetItem
 
@@ -65,7 +66,7 @@ class MolmoPointGetItem(GetItem):
 # Model
 # ---------------------------------------------------------------------------
 
-class MolmoPointModel(Model, SupportsGetItem, TorchModelMixin):
+class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin):
     """FiftyOne model wrapping MolmoPoint for keypoint prediction.
 
     Given one or more object descriptions, the model returns a
@@ -89,6 +90,7 @@ class MolmoPointModel(Model, SupportsGetItem, TorchModelMixin):
         prompt: Optional[Union[str, List[str]]] = None,
         **kwargs,
     ):
+        fom.SamplesMixin.__init__(self)
         SupportsGetItem.__init__(self)
         self._preprocess = False
         self._fields = {}
@@ -98,30 +100,9 @@ class MolmoPointModel(Model, SupportsGetItem, TorchModelMixin):
         self.device = get_device()
         logger.info(f"Using device: {self.device}")
 
-        logger.info(f"Loading MolmoPoint processor from {model_path}")
-        self.processor = AutoProcessor.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            padding_side="left",
-        )
-
-        model_kwargs = {"trust_remote_code": True}
-        if self.device == "cuda":
-            capability = torch.cuda.get_device_capability(0)
-            model_kwargs["torch_dtype"] = (
-                torch.bfloat16 if capability[0] >= 8 else torch.float16
-            )
-            model_kwargs["device_map"] = self.device
-        else:
-            model_kwargs["torch_dtype"] = torch.float32
-
-        logger.info(f"Loading MolmoPoint model from {model_path}")
-        self._model = AutoModelForImageTextToText.from_pretrained(
-            model_path, **model_kwargs
-        )
-        if self.device != "cuda":
-            self._model = self._model.to(self.device)
-        self._model.eval()
+        # Lazy-loaded on first call to predict_all
+        self._model = None
+        self.processor = None
 
     # ------------------------------------------------------------------
     # prompt property
@@ -218,6 +199,37 @@ class MolmoPointModel(Model, SupportsGetItem, TorchModelMixin):
 
     def build_get_item(self, field_mapping=None):
         return MolmoPointGetItem(field_mapping=field_mapping)
+
+    # ------------------------------------------------------------------
+    # Model loading
+    # ------------------------------------------------------------------
+
+    def _load_model(self):
+        """Load the processor and model weights (called lazily on first use)."""
+        logger.info(f"Loading MolmoPoint processor from {self.model_path}")
+        self.processor = AutoProcessor.from_pretrained(
+            self.model_path,
+            trust_remote_code=True,
+            padding_side="left",
+        )
+
+        model_kwargs = {"trust_remote_code": True}
+        if self.device == "cuda":
+            capability = torch.cuda.get_device_capability(0)
+            model_kwargs["torch_dtype"] = (
+                torch.bfloat16 if capability[0] >= 8 else torch.float16
+            )
+            model_kwargs["device_map"] = self.device
+        else:
+            model_kwargs["torch_dtype"] = torch.float32
+
+        logger.info(f"Loading MolmoPoint model from {self.model_path}")
+        self._model = AutoModelForImageTextToText.from_pretrained(
+            self.model_path, **model_kwargs
+        )
+        if self.device != "cuda":
+            self._model = self._model.to(self.device)
+        self._model.eval()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -338,6 +350,9 @@ class MolmoPointModel(Model, SupportsGetItem, TorchModelMixin):
         Returns:
             List of ``fo.Keypoints``, one per item in *batch*.
         """
+        if self._model is None:
+            self._load_model()
+
         images = [item["image"] for item in batch]
         sample_prompts = [item.get("prompt") for item in batch]
 
@@ -385,15 +400,34 @@ class MolmoPointModel(Model, SupportsGetItem, TorchModelMixin):
 
         return [Keypoints(keypoints=kps) for kps in accumulated]
 
-    def predict(self, image: np.ndarray, sample=None) -> Keypoints:
+    def predict(self, arg, sample=None) -> Keypoints:
         """Run inference on a single image.
 
+        Accepts a dict (from the DataLoader / GetItem path) or a numpy array
+        (from the SamplesMixin single-sample path). When a ``sample`` object
+        is provided and ``needs_fields`` maps ``"prompt_field"`` to a dataset
+        field, the per-sample field value is used as the prompt.
+
         Args:
-            image: H x W x C uint8 numpy array (RGB).
-            sample: Unused; included for API compatibility.
+            arg: Dict with ``"image"`` and ``"prompt"`` keys (from GetItem),
+                or an H x W x C uint8 numpy array (RGB).
+            sample: Optional FiftyOne sample, used to read per-sample prompt
+                fields when ``model.needs_fields`` is set.
 
         Returns:
             ``fo.Keypoints``
         """
-        pil_image = Image.fromarray(image)
-        return self.predict_all([{"image": pil_image, "prompt": None}])[0]
+        if isinstance(arg, dict):
+            batch_item = arg
+        else:
+            pil_image = Image.fromarray(arg)
+
+            prompt = None
+            if sample is not None and "prompt_field" in self._fields:
+                field_name = self._fields["prompt_field"]
+                if sample.has_field(field_name):
+                    prompt = sample.get_field(field_name)
+
+            batch_item = {"image": pil_image, "prompt": prompt}
+
+        return self.predict_all([batch_item])[0]
