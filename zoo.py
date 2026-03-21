@@ -246,35 +246,34 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
             return torch.autocast("cuda", dtype=dtype)
         return contextlib.nullcontext()
 
-    def _run_batch_for_object(
-        self, batch: List[Image.Image], obj: str
-    ) -> List[list]:
-        """Run one generation pass for *obj* over all images in *batch*.
+    def _run_single_for_object(self, img: Image.Image, obj: str) -> list:
+        """Run one generation pass for *obj* on a single image.
+
+        MolmoPoint's custom ``forward`` method uses Python's ``and`` operator
+        on multi-element tensors, which raises a ``RuntimeError`` for
+        batch_size > 1. Images must therefore be processed one at a time at
+        the model level.
 
         Args:
-            batch: List of PIL Images.
-            obj: Single object description (e.g. ``"boat"``).
+            img: A single PIL Image.
+            obj: Object description (e.g. ``"boat"``).
 
         Returns:
-            List of raw point lists (one per image), where each element is
-            a list of ``[object_id, image_num, x, y]`` entries with absolute
-            pixel coordinates.
+            List of ``[object_id, image_num, x, y]`` entries with absolute
+            pixel coordinates for this image.
         """
-        conversations = [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"Point to the {obj}"},
-                        {"type": "image", "image": img},
-                    ],
-                }
-            ]
-            for img in batch
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"Point to the {obj}"},
+                    {"type": "image", "image": img},
+                ],
+            }
         ]
 
         inputs = self.processor.apply_chat_template(
-            conversations,
+            conversation,
             tokenize=True,
             add_generation_prompt=True,
             return_tensors="pt",
@@ -295,23 +294,18 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
             )
 
         generated_tokens = output[:, inputs["input_ids"].size(1):]
-        generated_texts = self.processor.post_process_image_text_to_text(
+        generated_text = self.processor.post_process_image_text_to_text(
             generated_tokens,
             skip_special_tokens=False,
             clean_up_tokenization_spaces=False,
+        )[0]
+
+        return self._model.extract_image_points(
+            generated_text,
+            metadata["token_pooling"],
+            metadata["subpatch_mapping"],
+            metadata["image_sizes"],
         )
-
-        batch_points = []
-        for i, gen_text in enumerate(generated_texts):
-            points = self._model.extract_image_points(
-                gen_text,
-                metadata["token_pooling"][i],
-                metadata["subpatch_mapping"][i],
-                metadata["image_sizes"][i],
-            )
-            batch_points.append(points)
-
-        return batch_points
 
     # ------------------------------------------------------------------
     # Core inference
@@ -333,15 +327,17 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
     def predict_all(
         self, batch: List[dict], preprocess=None
     ) -> List[Keypoints]:
-        """Run batched inference for all configured object prompts.
+        """Run inference over a batch of images.
 
         Each item in *batch* is a dict with keys ``"image"`` (PIL Image) and
-        ``"prompt"`` (per-sample object string / list, or ``None`` to use the
-        global ``model.prompt``).
+        ``"prompt"`` (per-sample object string / list, or ``None`` to fall back
+        to the global ``model.prompt``).
 
-        When all samples share the same prompt, a single batched forward pass
-        is made per object string. When prompts differ across samples, each
-        sample is processed individually.
+        MolmoPoint's model code does not support batch_size > 1 in its forward
+        pass, so images are processed one at a time. The DataLoader workers
+        still load images in parallel, so ``num_workers`` and ``batch_size``
+        passed to ``apply_model`` continue to benefit throughput via I/O
+        parallelism.
 
         Args:
             batch: List of dicts from ``MolmoPointGetItem``.
@@ -355,8 +351,6 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
 
         images = [item["image"] for item in batch]
         sample_prompts = [item.get("prompt") for item in batch]
-
-        # Resolve the effective object list for each sample
         per_sample_objects = [self._resolve_objects(p) for p in sample_prompts]
 
         if not any(per_sample_objects):
@@ -368,35 +362,18 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
 
         accumulated: List[List[Keypoint]] = [[] for _ in batch]
 
-        # Fast path: all samples share the same prompt → true batch inference
-        if len(set(tuple(o) for o in per_sample_objects)) == 1:
-            objects = per_sample_objects[0]
+        for i, (img, objects) in enumerate(zip(images, per_sample_objects)):
+            width, height = img.size
             for obj in objects:
-                batch_points = self._run_batch_for_object(images, obj)
-                for i, (img, points) in enumerate(zip(images, batch_points)):
-                    width, height = img.size
-                    for point in points:
-                        _obj_id, _img_num, x, y = point
-                        accumulated[i].append(
-                            Keypoint(
-                                label=obj,
-                                points=[[float(x) / width, float(y) / height]],
-                            )
+                points = self._run_single_for_object(img, obj)
+                for point in points:
+                    _obj_id, _img_num, x, y = point
+                    accumulated[i].append(
+                        Keypoint(
+                            label=obj,
+                            points=[[float(x) / width, float(y) / height]],
                         )
-        else:
-            # Slow path: per-sample prompts differ → process each individually
-            for i, (img, objects) in enumerate(zip(images, per_sample_objects)):
-                for obj in objects:
-                    points_list = self._run_batch_for_object([img], obj)
-                    width, height = img.size
-                    for point in points_list[0]:
-                        _obj_id, _img_num, x, y = point
-                        accumulated[i].append(
-                            Keypoint(
-                                label=obj,
-                                points=[[float(x) / width, float(y) / height]],
-                            )
-                        )
+                    )
 
         return [Keypoints(keypoints=kps) for kps in accumulated]
 
