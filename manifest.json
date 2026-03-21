@@ -1,0 +1,58 @@
+{
+    "name": "molmo-point",
+    "url": "https://github.com/harpreetsahota204/molmo_point",
+    "models": [
+        {
+            "base_name": "allenai/MolmoPoint-8B",
+            "base_filename": "MolmoPoint-8B",
+            "author": "Allen AI",
+            "license": "Apache-2.0",
+            "source": "https://huggingface.co/allenai/MolmoPoint-8B",
+            "description": "MolmoPoint-8B is a vision-language model that locates objects in images by pointing. Given a text prompt describing one or more objects, it returns normalized keypoint coordinates for each instance found. Supports multiple images per conversation.",
+            "tags": [
+                "keypoints",
+                "pointing",
+                "VLM",
+                "zero-shot",
+                "image-text-to-text"
+            ],
+            "date_added": "2025-03-21",
+            "requirements": {
+                "packages": ["torch", "transformers", "pillow", "huggingface-hub"],
+                "cpu": {
+                    "support": true
+                },
+                "gpu": {
+                    "support": true
+                }
+            }
+        },
+        {
+            "base_name": "allenai/MolmoPoint-Img-8B",
+            "base_filename": "MolmoPoint-Img-8B",
+            "author": "Allen AI",
+            "license": "Apache-2.0",
+            "source": "https://huggingface.co/allenai/MolmoPoint-Img-8B",
+            "description": "MolmoPoint-Img-8B is a vision-language model specialised for pointing at UI elements and objects in screenshots. Given a text prompt, it returns normalized keypoint coordinates for each matching element found.",
+            "tags": [
+                "keypoints",
+                "pointing",
+                "VLM",
+                "zero-shot",
+                "image-text-to-text",
+                "UI",
+                "screenshots"
+            ],
+            "date_added": "2025-03-21",
+            "requirements": {
+                "packages": ["torch", "transformers", "pillow", "huggingface-hub"],
+                "cpu": {
+                    "support": true
+                },
+                "gpu": {
+                    "support": true
+                }
+            }
+        }
+    ]
+}
