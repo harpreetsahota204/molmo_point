@@ -325,7 +325,7 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
         return self._prompt
 
     def predict_all(
-        self, batch: List[dict], preprocess=None
+        self, batch: List[dict], preprocess=None, samples=None
     ) -> List[Keypoints]:
         """Run inference over a batch of images.
 
