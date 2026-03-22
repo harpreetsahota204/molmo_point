@@ -91,9 +91,9 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
         self.device = get_device()
         logger.info(f"Using device: {self.device}")
 
-        # Lazy-loaded on first call to predict_all
         self._model = None
         self.processor = None
+        self._load_model()
 
     # ------------------------------------------------------------------
     # prompt property
@@ -197,7 +197,7 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
     # ------------------------------------------------------------------
 
     def _load_model(self):
-        """Load the processor and model weights (called lazily on first use)."""
+        """Load the processor and model weights onto the target device."""
         logger.info(f"Loading MolmoPoint processor from {self.model_path}")
         self.processor = AutoProcessor.from_pretrained(
             self.model_path,
@@ -356,9 +356,6 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
         Returns:
             List of ``fo.Keypoints``, one per item in *batch*.
         """
-        if self._model is None:
-            self._load_model()
-
         accumulated: List[List[Keypoint]] = [[] for _ in batch]
         field_name = self._get_field()
 
