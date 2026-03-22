@@ -38,28 +38,19 @@ def get_device():
 # ---------------------------------------------------------------------------
 
 class MolmoPointGetItem(GetItem):
-    """Loads a PIL Image (and optional per-sample prompt) from a sample.
+    """Loads a PIL Image from a sample's filepath.
 
-    When the user sets ``model.needs_fields = {"prompt_field": "my_field"}``,
-    FiftyOne adds ``"prompt_field"`` to the field mapping so that
-    ``sample_dict`` contains the per-sample value. If no mapping is set,
-    ``sample_dict.get("prompt_field")`` returns ``None`` and the model falls
-    back to the global ``model.prompt``.
+    Runs in DataLoader worker processes — I/O only, no model code.
+    Per-sample prompts are read from the sample object in ``predict_all``
+    via the ``samples`` parameter, not here.
     """
 
     @property
     def required_keys(self):
-        # Only real dataset fields that always exist.
-        # "prompt_field" enters field_mapping only when the user explicitly
-        # maps it via model.needs_fields, so it must NOT be listed here.
         return ["filepath"]
 
     def __call__(self, sample_dict):
-        image = Image.open(sample_dict["filepath"]).convert("RGB")
-        return {
-            "image": image,
-            "prompt": sample_dict.get("prompt_field"),  # None if not mapped
-        }
+        return Image.open(sample_dict["filepath"]).convert("RGB")
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +127,20 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
     def needs_fields(self, fields):
         self._fields = fields
 
+    def _get_field(self):
+        """Return the dataset field name to use for per-sample prompts, or None."""
+        if "prompt_field" in self._fields:
+            return self._fields["prompt_field"]
+        return next(iter(self._fields.values()), None)
+
+    def _get_field(self):
+        """Get the field name to use for prompt extraction."""
+        if "prompt_field" in self.needs_fields:
+            prompt_field = self.needs_fields["prompt_field"]
+        else:
+            prompt_field = next(iter(self.needs_fields.values()), None)
+        return prompt_field
+        
     # ------------------------------------------------------------------
     # Required properties from Model
     # ------------------------------------------------------------------
@@ -331,23 +336,29 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
         return self._prompt
 
     def predict_all(
-        self, batch: List[dict], preprocess=None, samples=None
+        self, batch: List[Image.Image], preprocess=None, samples=None
     ) -> List[Keypoints]:
         """Run inference over a batch of images.
 
-        Each item in *batch* is a dict with keys ``"image"`` (PIL Image) and
-        ``"prompt"`` (per-sample object string / list, or ``None`` to fall back
-        to the global ``model.prompt``).
+        *batch* is a list of PIL Images loaded by ``MolmoPointGetItem``.
 
-        MolmoPoint's model code does not support batch_size > 1 in its forward
-        pass, so images are processed one at a time. The DataLoader workers
-        still load images in parallel, so ``num_workers`` and ``batch_size``
-        passed to ``apply_model`` continue to benefit throughput via I/O
-        parallelism.
+        Per-sample prompts are resolved in priority order:
+        1. Value read from the sample's ``prompt_field`` dataset field
+           (when ``apply_model(..., prompt_field="my_field")`` is used, or
+           ``model.needs_fields = {"prompt_field": "my_field"}`` is set).
+        2. Global ``model.prompt``.
+
+        MolmoPoint's model code does not support batch_size > 1 in its
+        forward pass, so images are processed one at a time. The DataLoader
+        workers still load images in parallel, so ``num_workers`` and
+        ``batch_size`` passed to ``apply_model`` continue to improve
+        throughput via I/O parallelism.
 
         Args:
-            batch: List of dicts from ``MolmoPointGetItem``.
+            batch: List of PIL Images from ``MolmoPointGetItem``.
             preprocess: Unused; preprocessing is handled by GetItem.
+            samples: Optional list of FiftyOne samples, used to read
+                per-sample prompt fields.
 
         Returns:
             List of ``fo.Keypoints``, one per item in *batch*.
@@ -355,20 +366,26 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
         if self._model is None:
             self._load_model()
 
-        images = [item["image"] for item in batch]
-        sample_prompts = [item.get("prompt") for item in batch]
-        per_sample_objects = [self._resolve_objects(p) for p in sample_prompts]
-
-        if not any(per_sample_objects):
-            raise ValueError(
-                "No objects specified. Set model.prompt = ['boat', 'person'], "
-                "or pass prompt=... when loading the model, "
-                "or use model.needs_fields = {'prompt_field': 'your_field'}."
-            )
-
         accumulated: List[List[Keypoint]] = [[] for _ in batch]
+        field_name = self._get_field()
 
-        for i, (img, objects) in enumerate(zip(images, per_sample_objects)):
+        for i, img in enumerate(batch):
+            # Resolve per-sample prompt from sample field, fall back to global
+            sample_prompt = None
+            if field_name is not None and samples is not None and i < len(samples):
+                sample = samples[i]
+                if sample.has_field(field_name):
+                    sample_prompt = sample.get_field(field_name)
+
+            objects = self._resolve_objects(sample_prompt)
+
+            if not objects:
+                raise ValueError(
+                    "No objects specified. Set model.prompt = ['boat', 'person'], "
+                    "pass prompt_field= to apply_model(), "
+                    "or use model.needs_fields = {'prompt_field': 'your_field'}."
+                )
+
             width, height = img.size
             for obj in objects:
                 points = self._run_single_for_object(img, obj)
@@ -386,31 +403,24 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
     def predict(self, arg, sample=None) -> Keypoints:
         """Run inference on a single image.
 
-        Accepts a dict (from the DataLoader / GetItem path) or a numpy array
-        (from the SamplesMixin single-sample path). When a ``sample`` object
-        is provided and ``needs_fields`` maps ``"prompt_field"`` to a dataset
-        field, the per-sample field value is used as the prompt.
+        Accepts a PIL Image, a numpy array, or any object with a filepath
+        attribute. When a ``sample`` is provided and ``needs_fields`` (or
+        ``prompt_field=`` in ``apply_model``) maps a field, the per-sample
+        value is used as the prompt.
 
         Args:
-            arg: Dict with ``"image"`` and ``"prompt"`` keys (from GetItem),
-                or an H x W x C uint8 numpy array (RGB).
-            sample: Optional FiftyOne sample, used to read per-sample prompt
-                fields when ``model.needs_fields`` is set.
+            arg: PIL Image, H x W x C uint8 numpy array (RGB), or filepath.
+            sample: Optional FiftyOne sample for per-sample prompt resolution.
 
         Returns:
             ``fo.Keypoints``
         """
-        if isinstance(arg, dict):
-            batch_item = arg
+        if isinstance(arg, Image.Image):
+            pil_image = arg
         else:
             pil_image = Image.fromarray(arg)
 
-            prompt = None
-            if sample is not None and "prompt_field" in self._fields:
-                field_name = self._fields["prompt_field"]
-                if sample.has_field(field_name):
-                    prompt = sample.get_field(field_name)
-
-            batch_item = {"image": pil_image, "prompt": prompt}
-
-        return self.predict_all([batch_item])[0]
+        return self.predict_all(
+            [pil_image],
+            samples=[sample] if sample is not None else None,
+        )[0]
