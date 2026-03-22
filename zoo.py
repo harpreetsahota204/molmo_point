@@ -132,14 +132,6 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
         if "prompt_field" in self._fields:
             return self._fields["prompt_field"]
         return next(iter(self._fields.values()), None)
-
-    def _get_field(self):
-        """Get the field name to use for prompt extraction."""
-        if "prompt_field" in self.needs_fields:
-            prompt_field = self.needs_fields["prompt_field"]
-        else:
-            prompt_field = next(iter(self.needs_fields.values()), None)
-        return prompt_field
         
     # ------------------------------------------------------------------
     # Required properties from Model
@@ -327,9 +319,10 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
     def _resolve_objects(self, sample_prompt) -> List[str]:
         """Return the object list to use for a single sample.
 
-        Per-sample prompt (from a dataset field) takes priority over the
-        global ``model.prompt``. The value is normalised the same way as
-        the ``prompt`` setter.
+        If a per-sample prompt is provided (from a dataset field), it is used
+        as-is after normalisation — including returning an empty list when the
+        field value is empty. Use ``model.prompt`` for a global prompt applied
+        to all samples when no ``prompt_field`` is set.
         """
         if sample_prompt is not None:
             return self._normalize_prompt(sample_prompt)
@@ -380,11 +373,14 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
             objects = self._resolve_objects(sample_prompt)
 
             if not objects:
-                raise ValueError(
-                    "No objects specified. Set model.prompt = ['boat', 'person'], "
-                    "pass prompt_field= to apply_model(), "
-                    "or use model.needs_fields = {'prompt_field': 'your_field'}."
+                # Per-sample field was empty and no global prompt is set —
+                # store empty keypoints and move on rather than aborting the run.
+                logger.debug(
+                    "No objects resolved for sample %d — skipping (empty field "
+                    "value and no global model.prompt set).",
+                    i,
                 )
+                continue
 
             width, height = img.size
             for obj in objects:
