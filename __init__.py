@@ -4,7 +4,7 @@ import os
 from huggingface_hub import snapshot_download
 from fiftyone.operators import types
 
-from .zoo import MolmoPointImageModel, MolmoPointVideoModel
+from .zoo import MolmoPointImageModel, MolmoPointVideoModel  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
