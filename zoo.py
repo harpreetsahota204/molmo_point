@@ -400,7 +400,6 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         return MolmoPointVideoGetItem(field_mapping=field_mapping)
 
     def _load_model(self):
-        """Uses ``dtype="auto"`` on CUDA."""
         logger.info(f"Loading MolmoPoint-Vid processor from {self.model_path}")
         self.processor = AutoProcessor.from_pretrained(
             self.model_path,
@@ -410,7 +409,7 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
 
         model_kwargs = {"trust_remote_code": True}
         if self.device == "cuda":
-            model_kwargs["dtype"] = "auto"
+            model_kwargs["torch_dtype"] = self._cuda_dtype()
             model_kwargs["device_map"] = self.device
         else:
             model_kwargs["torch_dtype"] = torch.float32
