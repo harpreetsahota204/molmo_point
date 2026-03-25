@@ -517,15 +517,9 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         frame_kp_lists: Dict[int, List[Keypoint]] = {}
 
         for obj in objects:
-            try:
-                points, video_size = self._run_video_inference_for_object(
-                    video_path, obj
-                )
-            except Exception:
-                logger.exception(
-                    "Inference failed for object '%s' on '%s'", obj, video_path
-                )
-                continue
+            points, video_size = self._run_video_inference_for_object(
+                video_path, obj
+            )
 
             width = float(video_size[0])
             height = float(video_size[1])
