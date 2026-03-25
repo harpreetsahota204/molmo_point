@@ -533,8 +533,12 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
     def _run_video_inference_for_object(self, video_path: str, obj: str) -> tuple:
         """Run one generation pass for *obj* on a single video.
 
-        Uses ``apply_chat_template`` with ``type="video"`` directly — no
-        external ``process_vision_info`` utility needed.
+        Follows the two-step native API:
+        1. ``process_vision_info`` extracts raw frames and video kwargs.
+        2. ``processor(videos=..., video_metadata=..., return_pointing_metadata=True)``
+           builds inputs and populates ``metadata["timestamps"]`` and
+           ``metadata["video_size"]`` — these keys are NOT populated when
+           ``return_pointing_metadata=True`` is passed to ``apply_chat_template``.
 
         Args:
             video_path: Absolute path to the video file.
@@ -545,7 +549,9 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
             - ``points``: list of ``[point_id, timestamp_s, x_px, y_px]``
             - ``video_size``: ``(width, height)`` for coordinate normalisation
         """
-        conversation = [
+        from molmo_utils import process_vision_info
+
+        messages = [
             {
                 "role": "user",
                 "content": [
@@ -555,15 +561,25 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
             }
         ]
 
-        inputs = self.processor.apply_chat_template(
-            conversation,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
-            padding=True,
-            return_pointing_metadata=True,
+        _, videos, video_kwargs = process_vision_info(messages)
+        videos_list, video_metadatas = zip(*videos)
+        videos_list = list(videos_list)
+        video_metadatas = list(video_metadatas)
+
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
         )
+
+        inputs = self.processor(
+            videos=videos_list,
+            video_metadata=video_metadatas,
+            text=text,
+            padding=True,
+            return_tensors="pt",
+            return_pointing_metadata=True,
+            **video_kwargs,
+        )
+
         metadata = inputs.pop("metadata")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
@@ -576,12 +592,12 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
                 max_new_tokens=2048,
             )
 
-        generated_tokens = output[:, inputs["input_ids"].size(1):]
-        generated_text = self.processor.post_process_image_text_to_text(
+        generated_tokens = output[0, inputs["input_ids"].size(1):]
+        generated_text = self.processor.decode(
             generated_tokens,
-            skip_special_tokens=False,
+            skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
-        )[0]
+        )
 
         points = self._model.extract_video_points(
             generated_text,
