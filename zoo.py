@@ -29,6 +29,11 @@ from fiftyone.utils.torch import GetItem
 
 from transformers import AutoProcessor, AutoModelForImageTextToText
 
+try:
+    from molmo_utils import process_vision_info as _molmo_process_vision_info
+except ImportError:
+    _molmo_process_vision_info = None
+
 logger = logging.getLogger(__name__)
 
 _TRACKING_MAX_FPS = 10
@@ -49,11 +54,12 @@ def get_device():
 # ---------------------------------------------------------------------------
 
 class MolmoPointGetItem(GetItem):
-    """Loads data from a sample filepath for use in the DataLoader.
+    """Loads data from a sample dict for use in the DataLoader.
 
     For images: opens and returns a PIL Image in RGB.
-    For videos: returns the filepath string — video frames are extracted
-    during inference to avoid loading full video data in workers.
+    For videos: returns a lightweight dict with filepath and metadata —
+    video frames are extracted during inference to avoid loading full video
+    data in worker processes.
     """
 
     def __init__(self, media_type="image", **kwargs):
@@ -62,11 +68,16 @@ class MolmoPointGetItem(GetItem):
 
     @property
     def required_keys(self):
-        return ["filepath"]
+        # "metadata" is included so frame_rate is available for tracking's
+        # timestamp → frame number conversion without a separate DB lookup.
+        return ["filepath", "metadata"]
 
     def __call__(self, sample_dict):
         if self._media_type == "video":
-            return sample_dict["filepath"]
+            return {
+                "filepath": sample_dict["filepath"],
+                "metadata": sample_dict.get("metadata"),
+            }
         return Image.open(sample_dict["filepath"]).convert("RGB")
 
 
@@ -435,6 +446,11 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         max_fps: Optional[int] = None,
         **kwargs,
     ):
+        if _molmo_process_vision_info is None:
+            raise ImportError(
+                "molmo-utils is required for video inference. "
+                "Install it with: pip install molmo-utils"
+            )
         if operation not in ("tracking", "pointing"):
             raise ValueError(
                 f"Invalid operation '{operation}'. Must be 'tracking' or 'pointing'."
@@ -469,8 +485,6 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
             video_size: ``(width, height)`` of the video as processed by
                 the model, used for coordinate normalization.
         """
-        from molmo_utils import process_vision_info
-
         messages = [
             {
                 "role": "user",
@@ -481,7 +495,7 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
             }
         ]
 
-        _, videos, video_kwargs = process_vision_info(messages)
+        _, videos, video_kwargs = _molmo_process_vision_info(messages)
         videos_list, video_metadatas = zip(*videos)
         videos_list = list(videos_list)
         video_metadatas = list(video_metadatas)
@@ -529,23 +543,24 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
 
         return points, metadata["video_size"]
 
-    def _predict_tracking(self, video_path: str, objects: List[str], sample) -> Dict:
+    def _predict_tracking(self, video_path: str, objects: List[str], item_metadata) -> Dict:
         """Frame-level keypoints for tracking mode.
 
-        Requires ``sample.metadata.frame_rate`` for accurate timestamp-to-frame
-        conversion. Falls back to 30 fps with a warning if not available.
+        Requires sample metadata with ``frame_rate`` for accurate
+        timestamp-to-frame-number conversion. Falls back to 30 fps with a
+        warning if not available — call ``dataset.compute_metadata()`` first.
 
         Returns:
             Dict mapping 1-indexed frame numbers to
             ``{"keypoints": fo.Keypoints}``.
         """
         fps = 30.0
-        if (
-            sample is not None
-            and sample.metadata is not None
-            and sample.metadata.frame_rate
-        ):
-            fps = float(sample.metadata.frame_rate)
+        frame_rate = None
+        if item_metadata is not None:
+            # item_metadata is a FiftyOne VideoMetadata object
+            frame_rate = getattr(item_metadata, "frame_rate", None)
+        if frame_rate:
+            fps = float(frame_rate)
         else:
             logger.warning(
                 "No frame_rate in sample metadata for %s — falling back to "
@@ -626,7 +641,11 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         results = []
         field_name = self._get_field()
 
-        for i, video_path in enumerate(batch):
+        for i, item in enumerate(batch):
+            # GetItem returns a dict {"filepath": ..., "metadata": ...} for video
+            video_path = item["filepath"] if isinstance(item, dict) else item
+            item_metadata = item.get("metadata") if isinstance(item, dict) else None
+
             sample = (
                 samples[i]
                 if samples is not None and i < len(samples)
@@ -641,14 +660,21 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
             objects = self._resolve_objects(sample_prompt)
 
             if not objects:
-                logger.debug("No objects resolved for sample %d — skipping.", i)
+                logger.warning(
+                    "No objects resolved for sample %d ('%s') — skipping. "
+                    "Set model.prompt or pass prompt_field= to apply_model().",
+                    i,
+                    video_path,
+                )
                 results.append(
                     {} if self.operation == "tracking" else Keypoints(keypoints=[])
                 )
                 continue
 
             if self.operation == "tracking":
-                results.append(self._predict_tracking(video_path, objects, sample))
+                results.append(
+                    self._predict_tracking(video_path, objects, item_metadata)
+                )
             else:
                 results.append(self._predict_pointing(video_path, objects))
 
