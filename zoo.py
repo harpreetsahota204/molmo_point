@@ -113,6 +113,7 @@ class MolmoPointBaseModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMi
         self._preprocess = False
         self._fields = {}
         self.model_path = model_path
+        self._prompt = []
         self.prompt = prompt
 
         self.device = get_device()
@@ -454,14 +455,32 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         """Largest integer ≤ target_fps that evenly divides video_fps.
 
         ``molmo_utils`` requires ``sampling_fps`` to be an exact divisor of the
-        video's frame rate. This finds the closest safe value, e.g. for a 29 fps
-        video with target_fps=10 it returns 1.
+        video's frame rate. Uses a float ratio check so non-integer rates like
+        29.97 fps are handled correctly (integer rounding + modulo would pick
+        the wrong divisor for those).
         """
-        video_fps_int = round(video_fps)
-        for candidate in range(min(target_fps, video_fps_int), 0, -1):
-            if video_fps_int % candidate == 0:
+        for candidate in range(min(target_fps, int(video_fps)), 0, -1):
+            if abs(video_fps / candidate - round(video_fps / candidate)) < 0.01:
                 return candidate
         return 1
+
+    @staticmethod
+    def _file_fps(video_path: str) -> Optional[float]:
+        """Read the actual frame rate from the video file via PyAV.
+
+        PyAV is already a ``molmo_utils`` dependency. We use it here so our
+        ``sampling_fps`` is computed from the same fps value that ``molmo_utils``
+        will use internally, avoiding a divisibility mismatch when FiftyOne
+        metadata reports a rounded/different value (e.g. 30.0 for a true 29fps video).
+        """
+        try:
+            import av
+            with av.open(video_path) as container:
+                stream = container.streams.video[0]
+                rate = stream.average_rate
+                return float(rate) if rate else None
+        except Exception:
+            return None
 
     def _run_video_inference_for_object(
         self, video_path: str, obj: str, sampling_fps: int
@@ -590,11 +609,15 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
 
         In pointing mode the sparse model outputs are used as-is.
         """
-        sampling_fps = self._safe_sampling_fps(fps, self._max_fps)
+        # Use fps from the file itself so our sampling_fps matches what
+        # molmo_utils will see when it opens the video — FiftyOne metadata can
+        # report a rounded value (e.g. 30.0) for a true 29fps file.
+        actual_fps = self._file_fps(video_path) or fps
+        sampling_fps = self._safe_sampling_fps(actual_fps, self._max_fps)
         if sampling_fps != self._max_fps:
             logger.debug(
-                "max_fps=%d adjusted to %d to evenly divide video fps=%.4f for '%s'.",
-                self._max_fps, sampling_fps, fps, video_path,
+                "max_fps=%d adjusted to %d to evenly divide actual video fps=%.4f for '%s'.",
+                self._max_fps, sampling_fps, actual_fps, video_path,
             )
 
         frame_kp_lists: Dict[int, List[Keypoint]] = {}
@@ -609,7 +632,7 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
             if self._operation == "tracking":
                 obj_keyframes: Dict[int, list] = defaultdict(list)
                 for point_id, timestamp, x_px, y_px in points:
-                    frame_num = max(1, round(float(timestamp) * fps))
+                    frame_num = int(float(timestamp) * actual_fps) + 1
                     obj_keyframes[int(point_id)].append(
                         (frame_num, float(x_px), float(y_px))
                     )
@@ -632,7 +655,7 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
                         )
             else:
                 for point_id, timestamp, x_px, y_px in points:
-                    frame_num = max(1, round(float(timestamp) * fps))
+                    frame_num = int(float(timestamp) * actual_fps) + 1
                     frame_kp_lists.setdefault(frame_num, []).append(
                         Keypoint(
                             label=obj,
