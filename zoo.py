@@ -492,7 +492,12 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
                 self._max_fps, video_fps, safe_fps,
             )
 
-        video_content = {"type": "video", "video": video_path, "max_fps": safe_fps}
+        video_content = {
+            "type": "video",
+            "video": video_path,
+            "max_fps": safe_fps,
+            "sampling_fps": safe_fps,  # molmo_utils reads this key internally
+        }
         if self.num_frames is not None:
             video_content["num_frames"] = self.num_frames
         if self.frame_sample_mode is not None:
