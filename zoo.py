@@ -454,13 +454,14 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
     def _safe_sampling_fps(video_fps: float, target_fps: int) -> int:
         """Largest integer ≤ target_fps that evenly divides video_fps.
 
-        ``molmo_utils`` requires ``sampling_fps`` to be an exact divisor of the
-        video's frame rate. Uses a float ratio check so non-integer rates like
-        29.97 fps are handled correctly (integer rounding + modulo would pick
-        the wrong divisor for those).
+        ``molmo_utils`` truncates the video fps to an integer via ``int()``
+        before checking divisibility, so we must do the same here to stay
+        in sync.  E.g. 29.97 fps → ``int(29.97) == 29`` (prime) → only
+        valid sampling fps ≤ 10 is 1.
         """
-        for candidate in range(min(target_fps, int(video_fps)), 0, -1):
-            if abs(video_fps / candidate - round(video_fps / candidate)) < 0.01:
+        video_fps_int = int(video_fps)
+        for candidate in range(min(target_fps, video_fps_int), 0, -1):
+            if video_fps_int % candidate == 0:
                 return candidate
         return 1
 
