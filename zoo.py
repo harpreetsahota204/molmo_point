@@ -370,6 +370,11 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         prompt: Global object(s) to locate.
         operation: ``"tracking"`` (default) or ``"pointing"``.
         max_fps: Override default fps (10 for tracking, 2 for pointing).
+        num_frames: Maximum number of frames to sample from the video.
+            ``None`` uses the processor default (384 for MolmoPoint-8B).
+        frame_sample_mode: Frame sampling strategy passed to the processor,
+            e.g. ``"fps"`` or ``"uniform_last_frame"``. ``None`` uses the
+            processor default.
         interp_max_gap: Max frame gap to interpolate across in tracking mode.
             Gaps larger than this are left empty to avoid bridging scene cuts
             or long occlusions. Defaults to ``fps`` (1 second).
@@ -382,6 +387,8 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         prompt: Optional[Union[str, List[str]]] = None,
         operation: str = "tracking",
         max_fps: Optional[int] = None,
+        num_frames: Optional[int] = None,
+        frame_sample_mode: Optional[str] = None,
         interp_max_gap: Optional[int] = None,
         **kwargs,
     ):
@@ -396,6 +403,8 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
             if max_fps is not None
             else (_TRACKING_MAX_FPS if operation == "tracking" else _POINTING_MAX_FPS)
         )
+        self.num_frames = num_frames
+        self.frame_sample_mode = frame_sample_mode
         self.interp_max_gap = interp_max_gap
         super().__init__(model_path=model_path, prompt=prompt, **kwargs)
 
@@ -454,12 +463,18 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         """
         from molmo_utils import process_vision_info
 
+        video_content = {"type": "video", "video": video_path, "max_fps": self._max_fps}
+        if self.num_frames is not None:
+            video_content["num_frames"] = self.num_frames
+        if self.frame_sample_mode is not None:
+            video_content["frame_sample_mode"] = self.frame_sample_mode
+
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": self._build_prompt(obj)},
-                    {"type": "video", "video": video_path, "max_fps": self._max_fps},
+                    video_content,
                 ],
             }
         ]

@@ -210,7 +210,7 @@ dataset.apply_model(
 
 ### Switching operations without reloading
 
-The model stays on the GPU. You can freely change `operation`, `max_fps`, and `interp_max_gap` between runs:
+The model stays on the GPU. All inference parameters can be changed freely between runs:
 
 ```python
 # Switch to pointing — max_fps automatically updates to 2
@@ -222,9 +222,32 @@ model.max_fps = 5
 # Reset to automatic default for the current operation
 model.max_fps = None
 
+# Cap total frames sampled per video (default: processor default, 384 for MolmoPoint-8B)
+model.num_frames = 128
+
+# Override the frame sampling strategy
+model.frame_sample_mode = "fps"           # sample at max_fps
+model.frame_sample_mode = "uniform_last_frame"  # sample uniformly
+
 # Widen the interpolation gap limit for tracking (default is 1 second = fps frames)
 model.interp_max_gap = 60  # bridge gaps up to 60 frames
 ```
+
+These parameters can also be set at load time:
+
+```python
+model = foz.load_zoo_model(
+    "allenai/MolmoPoint-8B",
+    media_type="video",
+    operation="tracking",
+    max_fps=10,
+    num_frames=128,
+    frame_sample_mode="fps",
+    interp_max_gap=60,
+)
+```
+
+The relationship between `max_fps` and interpolation: higher `max_fps` → denser keyframes → less interpolation needed. Lower `max_fps` → sparser keyframes → more frames filled by interpolation. The `interp_max_gap` threshold is a safety net that prevents interpolation from silently bridging gaps where the object was genuinely absent.
 
 ### Per-sample prompts (video)
 

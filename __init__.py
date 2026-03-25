@@ -46,6 +46,8 @@ def load_model(model_name, model_path, **kwargs):
             - ``operation`` (``str``, video only): ``"tracking"`` or
               ``"pointing"``.
             - ``max_fps`` (``int``, video only): Override default fps.
+            - ``num_frames`` (``int``, video only): Max total frames to sample.
+            - ``frame_sample_mode`` (``str``, video only): Sampling strategy.
             - ``interp_max_gap`` (``int``, tracking only): Max frame gap to
               interpolate across. Defaults to ``fps`` (1 second).
 
@@ -127,6 +129,27 @@ def resolve_input(model_name, ctx):
         description=(
             "Maximum frames per second to sample from the video. "
             "Defaults: 10 for tracking, 2 for pointing."
+        ),
+        required=False,
+    )
+
+    inputs.int(
+        "num_frames",
+        label="Max frames (video only)",
+        description=(
+            "Maximum total frames to sample from the video. "
+            "Defaults to the processor default (384 for MolmoPoint-8B)."
+        ),
+        required=False,
+    )
+
+    inputs.str(
+        "frame_sample_mode",
+        label="Frame sample mode (video only)",
+        description=(
+            "Frame sampling strategy: 'fps' samples at max_fps, "
+            "'uniform_last_frame' samples uniformly. "
+            "Defaults to the processor default."
         ),
         required=False,
     )
