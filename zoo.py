@@ -449,7 +449,23 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
             return f"Track the {obj}."
         return f"Point to the {obj}."
 
-    def _run_video_inference_for_object(self, video_path: str, obj: str) -> tuple:
+    @staticmethod
+    def _safe_sampling_fps(video_fps: float, target_fps: int) -> int:
+        """Largest integer ≤ target_fps that evenly divides video_fps.
+
+        ``molmo_utils`` requires ``sampling_fps`` to be an exact divisor of the
+        video's frame rate. This finds the closest safe value, e.g. for a 29 fps
+        video with target_fps=2 it returns 1.
+        """
+        video_fps_int = round(video_fps)
+        for candidate in range(min(target_fps, video_fps_int), 0, -1):
+            if video_fps_int % candidate == 0:
+                return candidate
+        return 1
+
+    def _run_video_inference_for_object(
+        self, video_path: str, obj: str, video_fps: float
+    ) -> tuple:
         """Run one generation pass for *obj* on a single video.
 
         Uses the two-step native API: ``process_vision_info`` extracts frames
@@ -457,13 +473,26 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         builds inputs with ``metadata["timestamps"]`` and ``metadata["video_size"]``
         correctly populated.
 
+        Args:
+            video_path: Path to the video file.
+            obj: Object description to locate.
+            video_fps: Actual frame rate of the video, used to compute a safe
+                sampling fps that evenly divides the video fps.
+
         Returns:
             ``(points, video_size)`` — points is a list of
             ``[point_id, timestamp_s, x_px, y_px]``.
         """
         from molmo_utils import process_vision_info
 
-        video_content = {"type": "video", "video": video_path, "max_fps": self._max_fps}
+        safe_fps = self._safe_sampling_fps(video_fps, self._max_fps)
+        if safe_fps != self._max_fps:
+            logger.debug(
+                "max_fps=%d does not divide video fps=%.2f — using %d instead.",
+                self._max_fps, video_fps, safe_fps,
+            )
+
+        video_content = {"type": "video", "video": video_path, "max_fps": safe_fps}
         if self.num_frames is not None:
             video_content["num_frames"] = self.num_frames
         if self.frame_sample_mode is not None:
@@ -566,7 +595,7 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         frame_kp_lists: Dict[int, List[Keypoint]] = {}
 
         for obj in objects:
-            points, video_size = self._run_video_inference_for_object(video_path, obj)
+            points, video_size = self._run_video_inference_for_object(video_path, obj, fps)
             width = float(video_size[0])
             height = float(video_size[1])
 
