@@ -22,6 +22,7 @@ FiftyOne routing:
 """
 import contextlib
 import logging
+from collections import defaultdict
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -369,6 +370,9 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         prompt: Global object(s) to locate.
         operation: ``"tracking"`` (default) or ``"pointing"``.
         max_fps: Override default fps (10 for tracking, 2 for pointing).
+        interp_max_gap: Max frame gap to interpolate across in tracking mode.
+            Gaps larger than this are left empty to avoid bridging scene cuts
+            or long occlusions. Defaults to ``fps`` (1 second).
         **kwargs: Ignored.
     """
 
@@ -378,19 +382,51 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         prompt: Optional[Union[str, List[str]]] = None,
         operation: str = "tracking",
         max_fps: Optional[int] = None,
+        interp_max_gap: Optional[int] = None,
         **kwargs,
     ):
         if operation not in ("tracking", "pointing"):
             raise ValueError(
                 f"Invalid operation '{operation}'. Must be 'tracking' or 'pointing'."
             )
-        self.operation = operation
+        self._operation = operation
+        self._max_fps_explicit = max_fps is not None
         self._max_fps = (
             max_fps
             if max_fps is not None
             else (_TRACKING_MAX_FPS if operation == "tracking" else _POINTING_MAX_FPS)
         )
+        self.interp_max_gap = interp_max_gap
         super().__init__(model_path=model_path, prompt=prompt, **kwargs)
+
+    @property
+    def operation(self) -> str:
+        return self._operation
+
+    @operation.setter
+    def operation(self, value: str):
+        if value not in ("tracking", "pointing"):
+            raise ValueError(
+                f"Invalid operation '{value}'. Must be 'tracking' or 'pointing'."
+            )
+        self._operation = value
+        if not self._max_fps_explicit:
+            self._max_fps = _TRACKING_MAX_FPS if value == "tracking" else _POINTING_MAX_FPS
+
+    @property
+    def max_fps(self) -> int:
+        return self._max_fps
+
+    @max_fps.setter
+    def max_fps(self, value: Optional[int]):
+        if value is None:
+            self._max_fps_explicit = False
+            self._max_fps = (
+                _TRACKING_MAX_FPS if self._operation == "tracking" else _POINTING_MAX_FPS
+            )
+        else:
+            self._max_fps_explicit = True
+            self._max_fps = value
 
     @property
     def media_type(self):
@@ -399,46 +435,10 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
     def build_get_item(self, field_mapping=None):
         return MolmoPointVideoGetItem(field_mapping=field_mapping)
 
-    def _load_model(self):
-        logger.info(f"Loading MolmoPoint-Vid processor from {self.model_path}")
-        self.processor = AutoProcessor.from_pretrained(
-            self.model_path,
-            trust_remote_code=True,
-            padding_side="left",
-        )
-
-        model_kwargs = {"trust_remote_code": True}
-        if self.device == "cuda":
-            model_kwargs["torch_dtype"] = self._cuda_dtype()
-            model_kwargs["device_map"] = self.device
-        else:
-            model_kwargs["torch_dtype"] = torch.float32
-
-        logger.info(f"Loading MolmoPoint-Vid model from {self.model_path}")
-        self._model = AutoModelForImageTextToText.from_pretrained(
-            self.model_path, **model_kwargs
-        )
-        if self.device != "cuda":
-            self._model = self._model.to(self.device)
-        self._model.eval()
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     def _build_prompt(self, obj: str) -> str:
-        if self.operation == "tracking":
+        if self._operation == "tracking":
             return f"Track the {obj}."
         return f"Point to the {obj}."
-
-    @staticmethod
-    def _get_fps(metadata) -> Optional[float]:
-        """Return frame_rate from a VideoMetadata object, or None."""
-        if metadata is not None:
-            fps = getattr(metadata, "frame_rate", None)
-            if fps:
-                return float(fps)
-        return None
 
     def _run_video_inference_for_object(self, video_path: str, obj: str) -> tuple:
         """Run one generation pass for *obj* on a single video.
@@ -511,31 +511,87 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         )
         return points, metadata["video_size"]
 
+    @staticmethod
+    def _interpolate_keyframes(keyframes, max_gap=None):
+        """Linearly interpolate (x, y) positions between sparse keyframes.
+
+        Args:
+            keyframes: sorted list of ``(frame_idx, x, y)`` tuples (pixel coords).
+            max_gap: skip interpolation across gaps larger than this many frames.
+
+        Returns:
+            dict mapping ``frame_idx → (x, y)`` for every frame from the first
+            to the last keyframe, with gaps filled by linear interpolation.
+        """
+        positions = {}
+        for i, (f_idx, x, y) in enumerate(keyframes):
+            positions[f_idx] = (x, y)
+            if i + 1 < len(keyframes):
+                nf, nx, ny = keyframes[i + 1]
+                span = nf - f_idx
+                if span > 1 and (max_gap is None or span <= max_gap):
+                    for t in range(1, span):
+                        alpha = t / span
+                        positions[f_idx + t] = (
+                            x + alpha * (nx - x),
+                            y + alpha * (ny - y),
+                        )
+        return positions
+
     def _build_frame_dict(self, video_path: str, objects: List[str], fps: float) -> Dict:
-        """Inference for all objects → ``{frame_num: fo.Keypoints}``."""
+        """Inference for all objects → ``{frame_num: fo.Keypoints}``.
+
+        In tracking mode, sparse model keyframes are linearly interpolated per
+        object ID so every frame between the first and last detection is filled.
+        Gaps larger than one second (``fps`` frames) are left empty to avoid
+        bridging across scene cuts or long occlusions.
+
+        In pointing mode the sparse model outputs are used as-is.
+        """
         frame_kp_lists: Dict[int, List[Keypoint]] = {}
 
         for obj in objects:
-            points, video_size = self._run_video_inference_for_object(
-                video_path, obj
-            )
-
+            points, video_size = self._run_video_inference_for_object(video_path, obj)
             width = float(video_size[0])
             height = float(video_size[1])
 
-            for point in points:
-                point_id, timestamp, x_px, y_px = point
-                frame_num = max(1, round(float(timestamp) * fps))
-                frame_kp_lists.setdefault(frame_num, []).append(
-                    Keypoint(
-                        label=obj,
-                        index=int(point_id),
-                        points=[[
-                            max(0.0, min(1.0, float(x_px) / width)),
-                            max(0.0, min(1.0, float(y_px) / height)),
-                        ]],
+            if self._operation == "tracking":
+                obj_keyframes: Dict[int, list] = defaultdict(list)
+                for point_id, timestamp, x_px, y_px in points:
+                    frame_num = max(1, round(float(timestamp) * fps))
+                    obj_keyframes[int(point_id)].append(
+                        (frame_num, float(x_px), float(y_px))
                     )
-                )
+
+                max_gap = self.interp_max_gap if self.interp_max_gap is not None else int(fps)
+                for obj_id, kfs in obj_keyframes.items():
+                    kfs.sort(key=lambda k: k[0])
+                    for frame_num, (x_px, y_px) in self._interpolate_keyframes(
+                        kfs, max_gap=max_gap
+                    ).items():
+                        frame_kp_lists.setdefault(frame_num, []).append(
+                            Keypoint(
+                                label=obj,
+                                index=obj_id,
+                                points=[[
+                                    max(0.0, min(1.0, x_px / width)),
+                                    max(0.0, min(1.0, y_px / height)),
+                                ]],
+                            )
+                        )
+            else:
+                for point_id, timestamp, x_px, y_px in points:
+                    frame_num = max(1, round(float(timestamp) * fps))
+                    frame_kp_lists.setdefault(frame_num, []).append(
+                        Keypoint(
+                            label=obj,
+                            index=int(point_id),
+                            points=[[
+                                max(0.0, min(1.0, float(x_px) / width)),
+                                max(0.0, min(1.0, float(y_px) / height)),
+                            ]],
+                        )
+                    )
 
         return {fn: Keypoints(keypoints=kps) for fn, kps in frame_kp_lists.items()}
 
@@ -553,26 +609,20 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         FiftyOne writes integer-keyed dicts as frame-level labels.
         """
         results = []
+        field_name = self._get_field()
 
         for i, item in enumerate(batch):
             video_path = item["filepath"]
+            sample = samples[i] if samples is not None and i < len(samples) else None
+
+            item_metadata = item.get("metadata") or getattr(sample, "metadata", None)
+
             sample_prompt = item.get("prompt")
-            item_metadata = item.get("metadata")
-
-            # Fall back to sample object if metadata not in batch item
-            if item_metadata is None and samples is not None and i < len(samples):
-                item_metadata = getattr(samples[i], "metadata", None)
-
-            # Prompt: batch item → sample field fallback → global
-            if sample_prompt is None:
-                field_name = self._get_field()
-                sample = samples[i] if samples is not None and i < len(samples) else None
-                if field_name is not None and sample is not None:
-                    if sample.has_field(field_name):
-                        sample_prompt = sample.get_field(field_name)
+            if sample_prompt is None and field_name is not None and sample is not None:
+                if sample.has_field(field_name):
+                    sample_prompt = sample.get_field(field_name)
 
             objects = self._resolve_objects(sample_prompt)
-
             if not objects:
                 logger.warning(
                     "No objects resolved for '%s'. "
@@ -582,7 +632,7 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
                 results.append({})
                 continue
 
-            fps = self._get_fps(item_metadata)
+            fps = float(getattr(item_metadata, "frame_rate", None) or 0) or None
             if fps is None:
                 logger.warning(
                     "No frame_rate in metadata for '%s' — defaulting to 30 fps. "
@@ -596,33 +646,22 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         return results
 
     def predict(self, arg, sample=None) -> Dict:
-        """Run inference on a single video.
+        """Normalises *arg* into the dict format ``predict_all`` expects.
 
-        Normalises *arg* (filepath string, video-reader object, or dict from
-        GetItem) into the dict format expected by ``predict_all``, then
-        delegates. This makes the method work regardless of which pathway
-        FiftyOne uses to call it.
-
-        Args:
-            arg: Filepath string, video-reader with ``.inpath``, or a dict
-                with ``"filepath"`` (as returned by ``MolmoPointVideoGetItem``).
-            sample: FiftyOne sample for per-sample prompts and metadata.
-
-        Returns:
-            ``{frame_num: fo.Keypoints}`` dict, or ``{}`` if no objects resolved.
+        FiftyOne may pass a filepath string, a video-reader object (with
+        ``.inpath``), or a dict from ``MolmoPointVideoGetItem`` — all are
+        handled here so the model works on both the DataLoader and direct
+        predict pathways.
         """
         if isinstance(arg, dict):
             batch_item = arg
         else:
             filepath = arg if isinstance(arg, str) else arg.inpath
-
-            # Resolve prompt from sample via needs_fields
-            sample_prompt = None
             field_name = self._get_field()
+            sample_prompt = None
             if field_name is not None and sample is not None:
                 if sample.has_field(field_name):
                     sample_prompt = sample.get_field(field_name)
-
             batch_item = {
                 "filepath": filepath,
                 "prompt": sample_prompt,

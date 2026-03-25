@@ -46,6 +46,8 @@ def load_model(model_name, model_path, **kwargs):
             - ``operation`` (``str``, video only): ``"tracking"`` or
               ``"pointing"``.
             - ``max_fps`` (``int``, video only): Override default fps.
+            - ``interp_max_gap`` (``int``, tracking only): Max frame gap to
+              interpolate across. Defaults to ``fps`` (1 second).
 
     Returns:
         :class:`MolmoPointImageModel` or :class:`MolmoPointVideoModel`
@@ -125,6 +127,16 @@ def resolve_input(model_name, ctx):
         description=(
             "Maximum frames per second to sample from the video. "
             "Defaults: 10 for tracking, 2 for pointing."
+        ),
+        required=False,
+    )
+
+    inputs.int(
+        "interp_max_gap",
+        label="Interpolation max gap (tracking only)",
+        description=(
+            "Maximum number of frames to interpolate across between detections. "
+            "Gaps larger than this are left empty. Defaults to 1 second (fps frames)."
         ),
         required=False,
     )
