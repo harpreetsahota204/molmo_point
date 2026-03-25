@@ -2,7 +2,7 @@
 
 ![image/png](molmo_point_image.gif)
 
-MolmoPoint is a vision-language model from the Allen Institute for AI that locates objects in images by **pointing** — returning precise pixel coordinates — rather than generating bounding boxes. Given a natural language description like `"Point to the boats"`, MolmoPoint finds every matching instance in the image and returns a set of keypoints, one per object.
+MolmoPoint is a vision-language model from the Allen Institute for AI that locates and tracks objects in images and videos by **pointing** — returning precise pixel coordinates — rather than generating bounding boxes. Given a natural language description like `"Point to the boats"`, MolmoPoint finds every matching instance and returns a set of keypoints, one per object.
 
 ## What makes it different
 
@@ -16,8 +16,9 @@ Most grounding models predict coordinates as text output (e.g. `"[412, 308]"`), 
 
 | Model | Best for |
 |---|---|
-| `allenai/MolmoPoint-8B` | General-purpose pointing in natural images — objects, animals, people, scene elements |
+| `allenai/MolmoPoint-8B` | General-purpose pointing in natural images and videos |
 | `allenai/MolmoPoint-Img-8B` | UI elements and interactive components in screenshots and GUIs |
+| `allenai/MolmoPoint-Vid-4B` | Lightweight 4B model optimised for video pointing and tracking |
 
 ## When to use MolmoPoint
 
@@ -34,10 +35,12 @@ MolmoPoint is **not** a detection model — it returns center points, not boundi
 ## Installation
 
 ```bash
-pip install fiftyone "transformers<5.0" torch pillow huggingface-hub
+pip install fiftyone "transformers<5.0" torch pillow huggingface-hub molmo-utils
 ```
 
 > **Note:** MolmoPoint requires `transformers<5.0`. It was developed and tested against `transformers==4.57.1`. Installing `transformers>=5.0` will likely cause errors during model loading or inference.
+>
+> `molmo-utils` is required for video inference. It handles frame extraction and the two-step video preprocessing pipeline the model expects.
 
 ## Quickstart
 
@@ -94,7 +97,7 @@ model.prompt = "boat, person, life jacket"
 
 **Per-sample prompt from a dataset field:**
 
-If your dataset already has ground-truth labels, you can derive a per-image object list from them and pass it straight to the model via `prompt_field`. No manual `needs_fields` setup required.
+If your dataset already has ground-truth labels, you can derive a per-image object list from them and pass it straight to the model via `prompt_field`.
 
 ```python
 
@@ -104,25 +107,22 @@ import fiftyone.zoo as foz
 dataset = foz.load_zoo_dataset("quickstart")
 
 # Derive unique object labels per sample from existing ground-truth detections
-uniqe_objects_per_sample = [list(set(labels)) for labels in dataset.values("ground_truth.detections.label")]
+unique_objects_per_sample = [list(set(labels)) for labels in dataset.values("ground_truth.detections.label")]
 
-dataset.set_values(
-    "uniqe_objects_per_sample",
-    uniqe_objects_per_sample
-)
+dataset.set_values("unique_objects_per_sample", unique_objects_per_sample)
 
 model = foz.load_zoo_model("allenai/MolmoPoint-8B")
 
 dataset.apply_model(
     model,
-    prompt_field="uniqe_objects_per_sample",   # MolmoPoint reads per-sample objects from this field
+    prompt_field="unique_objects_per_sample",
     label_field="molmo_points",
     batch_size=4,
     num_workers=2,
 )
 ```
 
-This is useful for verifying or augmenting existing annotations — each image is prompted only with the object classes that actually appear in it.
+This is useful for verifying or augmenting existing annotations. Each image is prompted only with the object classes that actually appear in it.
 
 ## Loading the GUI model
 
@@ -135,16 +135,126 @@ model.prompt = ["submit button", "search bar", "navigation menu"]
 dataset.apply_model(model, label_field="ui_points")
 ```
 
-## Performance notes
+## Video tracking and pointing
 
-MolmoPoint's custom forward pass processes **one image at a time** internally (a constraint of the current model implementation). The `batch_size` and `num_workers` arguments to `apply_model` still control how many images are loaded in parallel by the DataLoader workers, which significantly improves throughput for I/O-bound workflows.
+MolmoPoint supports two video operations, controlled by the `operation` parameter:
+
+| Operation | Prompt pattern | Default `max_fps` | Output |
+|---|---|---|---|
+| `"tracking"` | `"Track the {obj}."` | 10 | Frame-level `fo.Keypoints` with object IDs, interpolated between detections |
+| `"pointing"` | `"Point to the {obj}."` | 2 | Frame-level `fo.Keypoints` on sparse frames only |
+
+### Important: call `compute_metadata()` first
+
+The model converts the timestamps it returns into FiftyOne frame numbers using the video's frame rate. Without metadata, it falls back to 30 fps with a warning:
 
 ```python
+dataset.compute_metadata()
+```
+
+### Video tracking quickstart
+
+```python
+import fiftyone as fo
+import fiftyone.zoo as foz
+
+foz.register_zoo_model_source(
+    "https://github.com/harpreetsahota204/molmo_point",
+    overwrite=True,
+)
+
+dataset = foz.load_zoo_dataset("quickstart-video")
+dataset.compute_metadata()
+
+model = foz.load_zoo_model("allenai/MolmoPoint-8B", media_type="video")
+model.operation = "tracking"
+model.prompt = ["person", "car", "dog"]
+
 dataset.apply_model(
     model,
-    label_field="molmo_points",
-    num_workers=4,   # parallel image loading
+    label_field="tracking_keypoints",
+    batch_size=1,
+    num_workers=2,
 )
+
+session = fo.launch_app(dataset)
+```
+
+### What gets written to the dataset
+
+For both operations, `apply_model` writes a `fo.Keypoints` to **each frame** that has at least one detection. Access them at `sample.frames[n]["<label_field>"]`.
+
+Each `fo.Keypoint` contains:
+
+- **`label`** — the object name from your prompt (e.g. `"person"`)
+- **`index`** — integer object ID from the model — the same object keeps the same ID across frames, making it useful for tracking identity over time
+- **`points`** — a single `[[x, y]]` coordinate pair, normalized to `[0, 1]`
+
+In **tracking mode**, the model emits detections at up to `max_fps` frames per second, and the wrapper linearly interpolates positions between consecutive detections of the same object, so every frame between the first and last detection is filled. Gaps larger than one second are left empty to avoid bridging scene cuts or long occlusions.
+
+### Video pointing
+
+Pointing samples the video sparsely and is useful when you just want to confirm that an object is present somewhere in the video without dense per-frame tracking:
+
+```python
+model.operation = "pointing"
+model.prompt = ["parked car", "pedestrian", "traffic light"]
+
+dataset.apply_model(
+    model,
+    label_field="pointing_keypoints",
+    batch_size=1,
+    num_workers=2,
+)
+```
+
+### Switching operations without reloading
+
+The model stays on the GPU. You can freely change `operation`, `max_fps`, and `interp_max_gap` between runs:
+
+```python
+# Switch to pointing — max_fps automatically updates to 2
+model.operation = "pointing"
+
+# Explicitly pin max_fps — won't change when you switch operation
+model.max_fps = 5
+
+# Reset to automatic default for the current operation
+model.max_fps = None
+
+# Widen the interpolation gap limit for tracking (default is 1 second = fps frames)
+model.interp_max_gap = 60  # bridge gaps up to 60 frames
+```
+
+### Per-sample prompts (video)
+
+Works the same as images — store a list of object names on each sample and pass the field name via `prompt_field`:
+
+```python
+# Derive objects from existing ground-truth labels
+sample_objects = [dataset.distinct("frames.detections.detections.label")] * len(dataset)
+dataset.set_values("sample_objects", sample_objects)
+
+model = foz.load_zoo_model("allenai/MolmoPoint-8B", media_type="video")
+model.operation = "tracking"
+
+dataset.apply_model(
+    model,
+    prompt_field="sample_objects",
+    label_field="tracking_keypoints",
+    batch_size=1,
+    num_workers=2,
+)
+```
+
+### Using the lightweight 4B video model
+
+`MolmoPoint-Vid-4B` is a smaller model optimised specifically for video. Swap it in by changing the model name — everything else is identical:
+
+```python
+model = foz.load_zoo_model("allenai/MolmoPoint-Vid-4B", media_type="video")
+model.operation = "tracking"
+model.prompt = ["swimmer"]
 ```
 
 ## Citation
