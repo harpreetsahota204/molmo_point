@@ -3,12 +3,20 @@ MolmoPoint model wrapper for the FiftyOne Model Zoo.
 
 Supports both allenai/MolmoPoint-8B (general) and
 allenai/MolmoPoint-Img-8B (UI / screenshot tasks).
+
+Supports image pointing and video pointing / tracking.
+
+Class hierarchy:
+    MolmoPointGetItem               — shared DataLoader worker transform
+    MolmoPointBaseModel             — shared model plumbing
+        MolmoPointImageModel        — media_type="image"
+        MolmoPointVideoModel        — media_type="video"
 """
 import contextlib
 import logging
-from typing import List, Optional, Union
+import math
+from typing import Dict, List, Optional, Union
 
-import numpy as np
 import torch
 from PIL import Image
 
@@ -22,6 +30,9 @@ from fiftyone.utils.torch import GetItem
 from transformers import AutoProcessor, AutoModelForImageTextToText
 
 logger = logging.getLogger(__name__)
+
+_TRACKING_MAX_FPS = 10
+_POINTING_MAX_FPS = 2
 
 
 def get_device():
@@ -38,41 +49,37 @@ def get_device():
 # ---------------------------------------------------------------------------
 
 class MolmoPointGetItem(GetItem):
-    """Loads a PIL Image from a sample's filepath.
+    """Loads data from a sample filepath for use in the DataLoader.
 
-    Runs in DataLoader worker processes — I/O only, no model code.
-    Per-sample prompts are read from the sample object in ``predict_all``
-    via the ``samples`` parameter, not here.
+    For images: opens and returns a PIL Image in RGB.
+    For videos: returns the filepath string — video frames are extracted
+    during inference to avoid loading full video data in workers.
     """
+
+    def __init__(self, media_type="image", **kwargs):
+        super().__init__(**kwargs)
+        self._media_type = media_type
 
     @property
     def required_keys(self):
         return ["filepath"]
 
     def __call__(self, sample_dict):
+        if self._media_type == "video":
+            return sample_dict["filepath"]
         return Image.open(sample_dict["filepath"]).convert("RGB")
 
 
 # ---------------------------------------------------------------------------
-# Model
+# Base model – shared plumbing for image and video variants
 # ---------------------------------------------------------------------------
 
-class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin):
-    """FiftyOne model wrapping MolmoPoint for keypoint prediction.
+class MolmoPointBaseModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin):
+    """Shared base class for MolmoPointImageModel and MolmoPointVideoModel.
 
-    Given one or more object descriptions, the model returns a
-    ``fo.Keypoints`` label for each sample containing one ``fo.Keypoint``
-    per located instance, with normalized [0, 1] coordinates.
-
-    Args:
-        model_path: Local directory or HuggingFace repo ID.
-        prompt: Object(s) to point at (global, applied to all samples).
-            Accepts a comma-separated string (``"boat, person"``) or a list
-            of strings (``["boat", "person"]``). Can also be set after
-            loading via ``model.prompt = ...``. For per-sample prompts, use
-            ``model.needs_fields = {"prompt_field": "your_field_name"}``
-            instead.
-        **kwargs: Additional keyword arguments (ignored).
+    Handles model loading, prompt management, FiftyOne batching boilerplate,
+    and device/dtype selection. Subclasses implement ``media_type`` and
+    ``predict_all``.
     """
 
     def __init__(
@@ -86,7 +93,7 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
         self._preprocess = False
         self._fields = {}
         self.model_path = model_path
-        self.prompt = prompt  # normalised via property setter
+        self.prompt = prompt
 
         self.device = get_device()
         logger.info(f"Using device: {self.device}")
@@ -101,12 +108,11 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
 
     @property
     def prompt(self) -> List[str]:
-        """List of object descriptions to locate (global, applied to all samples).
+        """List of object descriptions to locate.
 
         Can be set as a comma-separated string (``"boat, person"``) or a list
-        (``["boat", "person"]``). When ``needs_fields`` maps a dataset field to
-        ``"prompt_field"``, the per-sample value overrides this global prompt
-        for that sample.
+        (``["boat", "person"]``). Per-sample values from a dataset field
+        override this global prompt when ``needs_fields`` is configured.
         """
         return self._prompt
 
@@ -120,7 +126,6 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
 
     @property
     def needs_fields(self):
-        """Dict mapping logical keys to dataset field names."""
         return self._fields
 
     @needs_fields.setter
@@ -128,18 +133,17 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
         self._fields = fields
 
     def _get_field(self):
-        """Return the dataset field name to use for per-sample prompts, or None."""
         if "prompt_field" in self._fields:
             return self._fields["prompt_field"]
         return next(iter(self._fields.values()), None)
-        
+
     # ------------------------------------------------------------------
-    # Required properties from Model
+    # Required Model properties
     # ------------------------------------------------------------------
 
     @property
     def media_type(self):
-        return "image"
+        raise NotImplementedError
 
     @property
     def transforms(self):
@@ -158,7 +162,7 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
         return False
 
     # ------------------------------------------------------------------
-    # TorchModelMixin – custom collation for variable-size images
+    # TorchModelMixin – custom collation for variable-size inputs
     # ------------------------------------------------------------------
 
     @property
@@ -190,7 +194,9 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
     # ------------------------------------------------------------------
 
     def build_get_item(self, field_mapping=None):
-        return MolmoPointGetItem(field_mapping=field_mapping)
+        return MolmoPointGetItem(
+            media_type=self.media_type, field_mapping=field_mapping
+        )
 
     # ------------------------------------------------------------------
     # Model loading
@@ -221,12 +227,11 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
         self._model.eval()
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Shared helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def _normalize_prompt(value) -> List[str]:
-        """Normalise a raw prompt value into a list of stripped, non-empty strings."""
         if value is None:
             return []
         if isinstance(value, list):
@@ -235,10 +240,6 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
 
     @staticmethod
     def _cuda_dtype() -> torch.dtype:
-        """Return the appropriate float dtype for the current CUDA device.
-
-        Uses bfloat16 on compute capability >= 8 (Ampere+), float16 otherwise.
-        """
         return (
             torch.bfloat16
             if torch.cuda.get_device_capability(0)[0] >= 8
@@ -246,26 +247,47 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
         )
 
     def _autocast_ctx(self):
-        """Return appropriate autocast context for the current device."""
         if self.device == "cuda":
             return torch.autocast("cuda", dtype=self._cuda_dtype())
         return contextlib.nullcontext()
 
+    def _resolve_objects(self, sample_prompt) -> List[str]:
+        if sample_prompt is not None:
+            return self._normalize_prompt(sample_prompt)
+        return self._prompt
+
+
+# ---------------------------------------------------------------------------
+# Image model
+# ---------------------------------------------------------------------------
+
+class MolmoPointImageModel(MolmoPointBaseModel):
+    """MolmoPoint model for image pointing.
+
+    Given one or more object descriptions, returns a ``fo.Keypoints`` label
+    per sample with normalized [0, 1] coordinates.
+
+    Args:
+        model_path: Local directory or HuggingFace repo ID.
+        prompt: Object(s) to point at. Accepts a comma-separated string
+            (``"boat, person"``) or a list (``["boat", "person"]``).
+        **kwargs: Additional keyword arguments (ignored).
+    """
+
+    @property
+    def media_type(self):
+        return "image"
+
     def _run_single_for_object(self, img: Image.Image, obj: str) -> list:
         """Run one generation pass for *obj* on a single image.
 
-        MolmoPoint's custom ``forward`` method uses Python's ``and`` operator
-        on multi-element tensors, which raises a ``RuntimeError`` for
-        batch_size > 1. Images must therefore be processed one at a time at
-        the model level.
-
-        Args:
-            img: A single PIL Image.
-            obj: Object description (e.g. ``"boat"``).
+        MolmoPoint's custom ``forward`` uses Python's ``and`` operator on
+        multi-element tensors, which raises a ``RuntimeError`` for
+        batch_size > 1. Images must therefore be processed one at a time.
 
         Returns:
-            List of ``[object_id, image_num, x, y]`` entries with absolute
-            pixel coordinates for this image.
+            List of ``[object_id, image_num, x, y]`` with absolute pixel
+            coordinates.
         """
         conversation = [
             {
@@ -312,46 +334,15 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
             metadata["image_sizes"],
         )
 
-    # ------------------------------------------------------------------
-    # Core inference
-    # ------------------------------------------------------------------
-
-    def _resolve_objects(self, sample_prompt) -> List[str]:
-        """Return the object list to use for a single sample.
-
-        If a per-sample prompt is provided (from a dataset field), it is used
-        as-is after normalisation — including returning an empty list when the
-        field value is empty. Use ``model.prompt`` for a global prompt applied
-        to all samples when no ``prompt_field`` is set.
-        """
-        if sample_prompt is not None:
-            return self._normalize_prompt(sample_prompt)
-        return self._prompt
-
     def predict_all(
         self, batch: List[Image.Image], preprocess=None, samples=None
     ) -> List[Keypoints]:
         """Run inference over a batch of images.
 
-        *batch* is a list of PIL Images loaded by ``MolmoPointGetItem``.
-
-        Per-sample prompts are resolved in priority order:
-        1. Value read from the sample's ``prompt_field`` dataset field
-           (when ``apply_model(..., prompt_field="my_field")`` is used, or
-           ``model.needs_fields = {"prompt_field": "my_field"}`` is set).
-        2. Global ``model.prompt``.
-
-        MolmoPoint's model code does not support batch_size > 1 in its
-        forward pass, so images are processed one at a time. The DataLoader
-        workers still load images in parallel, so ``num_workers`` and
-        ``batch_size`` passed to ``apply_model`` continue to improve
-        throughput via I/O parallelism.
-
         Args:
             batch: List of PIL Images from ``MolmoPointGetItem``.
             preprocess: Unused; preprocessing is handled by GetItem.
-            samples: Optional list of FiftyOne samples, used to read
-                per-sample prompt fields.
+            samples: Optional FiftyOne samples for per-sample prompt resolution.
 
         Returns:
             List of ``fo.Keypoints``, one per item in *batch*.
@@ -360,7 +351,6 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
         field_name = self._get_field()
 
         for i, img in enumerate(batch):
-            # Resolve per-sample prompt from sample field, fall back to global
             sample_prompt = None
             if field_name is not None and samples is not None and i < len(samples):
                 sample = samples[i]
@@ -370,13 +360,7 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
             objects = self._resolve_objects(sample_prompt)
 
             if not objects:
-                # Per-sample field was empty and no global prompt is set —
-                # store empty keypoints and move on rather than aborting the run.
-                logger.debug(
-                    "No objects resolved for sample %d — skipping (empty field "
-                    "value and no global model.prompt set).",
-                    i,
-                )
+                logger.debug("No objects resolved for sample %d — skipping.", i)
                 continue
 
             width, height = img.size
@@ -396,13 +380,8 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
     def predict(self, arg, sample=None) -> Keypoints:
         """Run inference on a single image.
 
-        Accepts a PIL Image, a numpy array, or any object with a filepath
-        attribute. When a ``sample`` is provided and ``needs_fields`` (or
-        ``prompt_field=`` in ``apply_model``) maps a field, the per-sample
-        value is used as the prompt.
-
         Args:
-            arg: PIL Image, H x W x C uint8 numpy array (RGB), or filepath.
+            arg: PIL Image, H×W×C uint8 numpy array (RGB), or filepath.
             sample: Optional FiftyOne sample for per-sample prompt resolution.
 
         Returns:
@@ -415,5 +394,277 @@ class MolmoPointModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMixin)
 
         return self.predict_all(
             [pil_image],
+            samples=[sample] if sample is not None else None,
+        )[0]
+
+
+# ---------------------------------------------------------------------------
+# Video model
+# ---------------------------------------------------------------------------
+
+class MolmoPointVideoModel(MolmoPointBaseModel):
+    """MolmoPoint model for video pointing and tracking.
+
+    Two operations are supported:
+
+    - ``"tracking"`` — follows objects across frames at ``max_fps=10``.
+      Returns frame-level ``fo.Keypoints`` keyed by 1-indexed frame number.
+      Requires ``dataset.compute_metadata()`` for accurate frame numbers.
+
+    - ``"pointing"`` — identifies objects on sparse frames at ``max_fps=2``.
+      Returns sample-level ``fo.Keypoints``.
+
+    Both operations return ``fo.Keypoint`` with ``label`` set to the object
+    name and ``index`` set to the integer ``object_id`` emitted by the model.
+    Coordinates are normalized to ``[0, 1]``.
+
+    Args:
+        model_path: Local directory or HuggingFace repo ID.
+        prompt: Object(s) to locate. Accepts a comma-separated string or list.
+        operation: ``"tracking"`` (default) or ``"pointing"``.
+        max_fps: Override default frame sampling rate. Defaults to 10 for
+            tracking, 2 for pointing.
+        **kwargs: Additional keyword arguments (ignored).
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        prompt: Optional[Union[str, List[str]]] = None,
+        operation: str = "tracking",
+        max_fps: Optional[int] = None,
+        **kwargs,
+    ):
+        if operation not in ("tracking", "pointing"):
+            raise ValueError(
+                f"Invalid operation '{operation}'. Must be 'tracking' or 'pointing'."
+            )
+        self.operation = operation
+        self._max_fps = (
+            max_fps
+            if max_fps is not None
+            else (_TRACKING_MAX_FPS if operation == "tracking" else _POINTING_MAX_FPS)
+        )
+        super().__init__(model_path=model_path, prompt=prompt, **kwargs)
+
+    @property
+    def media_type(self):
+        return "video"
+
+    def _build_prompt(self, obj: str) -> str:
+        if self.operation == "tracking":
+            return f"Track the {obj}."
+        return f"Point to the {obj}."
+
+    def _run_video_inference_for_object(self, video_path: str, obj: str):
+        """Run one generation pass for *obj* on a single video.
+
+        Args:
+            video_path: Path to the video file.
+            obj: Object description (e.g. ``"swimmer"``).
+
+        Returns:
+            points: List of ``(object_id, timestamp_seconds, x, y)`` tuples
+                with absolute pixel coordinates in ``video_size`` space.
+            video_size: ``(width, height)`` of the video as processed by
+                the model, used for coordinate normalization.
+        """
+        from molmo_utils import process_vision_info
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": self._build_prompt(obj)},
+                    {"type": "video", "video": video_path, "max_fps": self._max_fps},
+                ],
+            }
+        ]
+
+        _, videos, video_kwargs = process_vision_info(messages)
+        videos_list, video_metadatas = zip(*videos)
+        videos_list = list(videos_list)
+        video_metadatas = list(video_metadatas)
+
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+        inputs = self.processor(
+            videos=videos_list,
+            video_metadata=video_metadatas,
+            text=text,
+            padding=True,
+            return_tensors="pt",
+            return_pointing_metadata=True,
+            **video_kwargs,
+        )
+
+        metadata = inputs.pop("metadata")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        with torch.inference_mode(), self._autocast_ctx():
+            output = self._model.generate(
+                **inputs,
+                logits_processor=self._model.build_logit_processor_from_inputs(
+                    inputs
+                ),
+                max_new_tokens=2048,
+            )
+
+        generated_tokens = output[0, inputs["input_ids"].size(1):]
+        generated_text = self.processor.decode(
+            generated_tokens,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        points = self._model.extract_video_points(
+            generated_text,
+            metadata["token_pooling"],
+            metadata["subpatch_mapping"],
+            metadata["timestamps"],
+            metadata["video_size"],
+        )
+
+        return points, metadata["video_size"]
+
+    def _predict_tracking(self, video_path: str, objects: List[str], sample) -> Dict:
+        """Frame-level keypoints for tracking mode.
+
+        Requires ``sample.metadata.frame_rate`` for accurate timestamp-to-frame
+        conversion. Falls back to 30 fps with a warning if not available.
+
+        Returns:
+            Dict mapping 1-indexed frame numbers to
+            ``{"keypoints": fo.Keypoints}``.
+        """
+        fps = 30.0
+        if (
+            sample is not None
+            and sample.metadata is not None
+            and sample.metadata.frame_rate
+        ):
+            fps = float(sample.metadata.frame_rate)
+        else:
+            logger.warning(
+                "No frame_rate in sample metadata for %s — falling back to "
+                "30 fps. Run dataset.compute_metadata() for accurate frame "
+                "numbers.",
+                video_path,
+            )
+
+        frame_dict: Dict = {}
+
+        for obj in objects:
+            points, video_size = self._run_video_inference_for_object(video_path, obj)
+            vw = float(video_size[0])
+            vh = float(video_size[1])
+
+            for obj_id, ts, x, y in points:
+                frame_num = math.floor(float(ts) * fps) + 1
+                x_norm = max(0.0, min(1.0, float(x) / vw))
+                y_norm = max(0.0, min(1.0, float(y) / vh))
+
+                if frame_num not in frame_dict:
+                    frame_dict[frame_num] = {"keypoints": Keypoints(keypoints=[])}
+
+                frame_dict[frame_num]["keypoints"].keypoints.append(
+                    Keypoint(
+                        label=obj,
+                        index=int(obj_id),
+                        points=[[x_norm, y_norm]],
+                    )
+                )
+
+        return frame_dict
+
+    def _predict_pointing(self, video_path: str, objects: List[str]) -> Keypoints:
+        """Sample-level keypoints for pointing mode.
+
+        Returns:
+            ``fo.Keypoints`` with one entry per detected instance.
+        """
+        all_keypoints: List[Keypoint] = []
+
+        for obj in objects:
+            points, video_size = self._run_video_inference_for_object(video_path, obj)
+            vw = float(video_size[0])
+            vh = float(video_size[1])
+
+            for obj_id, ts, x, y in points:
+                all_keypoints.append(
+                    Keypoint(
+                        label=obj,
+                        index=int(obj_id),
+                        points=[[
+                            max(0.0, min(1.0, float(x) / vw)),
+                            max(0.0, min(1.0, float(y) / vh)),
+                        ]],
+                    )
+                )
+
+        return Keypoints(keypoints=all_keypoints)
+
+    def predict_all(self, batch: List[str], preprocess=None, samples=None):
+        """Run inference over a batch of video filepaths.
+
+        Each video is processed sequentially — one ``model.generate()`` call
+        per object per video. The DataLoader workers still accelerate I/O.
+
+        Args:
+            batch: List of video filepaths from ``MolmoPointGetItem``.
+            preprocess: Unused.
+            samples: Optional FiftyOne samples for per-sample prompt resolution
+                and metadata (frame_rate required for tracking).
+
+        Returns:
+            For ``"tracking"``: list of dicts mapping frame numbers to
+            ``{"keypoints": fo.Keypoints}``.
+            For ``"pointing"``: list of ``fo.Keypoints``.
+        """
+        results = []
+        field_name = self._get_field()
+
+        for i, video_path in enumerate(batch):
+            sample = (
+                samples[i]
+                if samples is not None and i < len(samples)
+                else None
+            )
+
+            sample_prompt = None
+            if field_name is not None and sample is not None:
+                if sample.has_field(field_name):
+                    sample_prompt = sample.get_field(field_name)
+
+            objects = self._resolve_objects(sample_prompt)
+
+            if not objects:
+                logger.debug("No objects resolved for sample %d — skipping.", i)
+                results.append(
+                    {} if self.operation == "tracking" else Keypoints(keypoints=[])
+                )
+                continue
+
+            if self.operation == "tracking":
+                results.append(self._predict_tracking(video_path, objects, sample))
+            else:
+                results.append(self._predict_pointing(video_path, objects))
+
+        return results
+
+    def predict(self, arg, sample=None):
+        """Run inference on a single video filepath.
+
+        Args:
+            arg: Path to a video file.
+            sample: Optional FiftyOne sample for per-sample prompt resolution.
+
+        Returns:
+            Frame-level dict (tracking) or ``fo.Keypoints`` (pointing).
+        """
+        return self.predict_all(
+            [arg],
             samples=[sample] if sample is not None else None,
         )[0]

@@ -8,17 +8,46 @@
             "author": "Allen AI",
             "license": "Apache-2.0",
             "source": "https://huggingface.co/allenai/MolmoPoint-8B",
-            "description": "MolmoPoint-8B is a vision-language model that locates objects in images by pointing. Given a text prompt describing one or more objects, it returns normalized keypoint coordinates for each instance found. Supports multiple images per conversation.",
+            "description": "MolmoPoint-8B is a vision-language model that locates and tracks objects in images and videos by pointing. For images, it returns normalized keypoint coordinates per instance. For videos, it supports frame-level tracking (follows objects over time) and sparse pointing (identifies objects across sampled frames).",
             "tags": [
                 "keypoints",
                 "pointing",
+                "tracking",
+                "video",
                 "VLM",
                 "zero-shot",
                 "image-text-to-text"
             ],
             "date_added": "2025-03-21",
             "requirements": {
-                "packages": ["torch", "transformers", "pillow", "huggingface-hub"],
+                "packages": ["torch", "transformers", "pillow", "huggingface-hub", "molmo-utils"],
+                "cpu": {
+                    "support": true
+                },
+                "gpu": {
+                    "support": true
+                }
+            }
+        },
+        {
+            "base_name": "allenai/MolmoPoint-Vid-4B",
+            "base_filename": "MolmoPoint-Vid-4B",
+            "author": "Allen AI",
+            "license": "Apache-2.0",
+            "source": "https://huggingface.co/allenai/MolmoPoint-Vid-4B",
+            "description": "MolmoPoint-Vid-4B is a 4B vision-language model specialised for video pointing and tracking. Given a text prompt, it returns keypoint coordinates for each matching object across video frames. Supports frame-level tracking and sparse pointing modes.",
+            "tags": [
+                "keypoints",
+                "pointing",
+                "tracking",
+                "video",
+                "VLM",
+                "zero-shot",
+                "image-text-to-text"
+            ],
+            "date_added": "2025-03-25",
+            "requirements": {
+                "packages": ["torch", "transformers", "pillow", "huggingface-hub", "molmo-utils"],
                 "cpu": {
                     "support": true
                 },
@@ -45,7 +74,7 @@
             ],
             "date_added": "2025-03-21",
             "requirements": {
-                "packages": ["torch", "transformers", "pillow", "huggingface-hub"],
+                "packages": ["torch", "transformers", "pillow", "huggingface-hub", "molmo-utils"],
                 "cpu": {
                     "support": true
                 },
