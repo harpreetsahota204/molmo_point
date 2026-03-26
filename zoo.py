@@ -113,7 +113,6 @@ class MolmoPointBaseModel(Model, fom.SamplesMixin, SupportsGetItem, TorchModelMi
         self._preprocess = False
         self._fields = {}
         self.model_path = model_path
-        self._prompt = []
         self.prompt = prompt
 
         self.device = get_device()
@@ -451,16 +450,27 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         return f"Point to the {obj}."
 
     @staticmethod
-    def _safe_sampling_fps(video_fps: float, target_fps: int) -> int:
-        """Largest integer ≤ target_fps that evenly divides video_fps.
+    def _safe_sampling_fps(
+        video_fps: float, target_fps: int, library_cap: int = 8
+    ) -> int:
+        """Largest integer ≤ min(target_fps, library_cap) that evenly divides video_fps.
 
         ``molmo_utils`` truncates the video fps to an integer via ``int()``
-        before checking divisibility, so we must do the same here to stay
-        in sync.  E.g. 29.97 fps → ``int(29.97) == 29`` (prime) → only
-        valid sampling fps ≤ 10 is 1.
+        before checking divisibility, and also caps candidates at
+        ``MAX_VIDEO_FPS`` inside ``get_candidate_target_fps``.  We mirror
+        both constraints here so the value we pass is never rejected.
+
+        Args:
+            video_fps: Raw frame rate from the video file (may be non-integer,
+                e.g. 29.97).
+            target_fps: Desired upper bound from our own tracking/pointing
+                settings.
+            library_cap: ``molmo_utils.vision_process.MAX_VIDEO_FPS`` — the
+                hard ceiling enforced internally by ``get_candidate_target_fps``.
         """
         video_fps_int = int(video_fps)
-        for candidate in range(min(target_fps, video_fps_int), 0, -1):
+        upper = min(target_fps, video_fps_int, library_cap)
+        for candidate in range(upper, 0, -1):
             if video_fps_int % candidate == 0:
                 return candidate
         return 1
@@ -554,7 +564,7 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
                 logits_processor=self._model.build_logit_processor_from_inputs(
                     inputs
                 ),
-                max_new_tokens=2048,
+                max_new_tokens=4096,
             )
 
         generated_tokens = output[0, inputs["input_ids"].size(1):]
@@ -613,8 +623,12 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
         # Use fps from the file itself so our sampling_fps matches what
         # molmo_utils will see when it opens the video — FiftyOne metadata can
         # report a rounded value (e.g. 30.0) for a true 29fps file.
+        from molmo_utils.vision_process import MAX_VIDEO_FPS
+
         actual_fps = self._file_fps(video_path) or fps
-        sampling_fps = self._safe_sampling_fps(actual_fps, self._max_fps)
+        sampling_fps = self._safe_sampling_fps(
+            actual_fps, self._max_fps, int(MAX_VIDEO_FPS)
+        )
         if sampling_fps != self._max_fps:
             logger.debug(
                 "max_fps=%d adjusted to %d to evenly divide actual video fps=%.4f for '%s'.",
@@ -730,14 +744,9 @@ class MolmoPointVideoModel(MolmoPointBaseModel):
             batch_item = arg
         else:
             filepath = arg if isinstance(arg, str) else arg.inpath
-            field_name = self._get_field()
-            sample_prompt = None
-            if field_name is not None and sample is not None:
-                if sample.has_field(field_name):
-                    sample_prompt = sample.get_field(field_name)
             batch_item = {
                 "filepath": filepath,
-                "prompt": sample_prompt,
+                "prompt": None,
                 "metadata": getattr(sample, "metadata", None) if sample else None,
             }
 
